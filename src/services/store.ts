@@ -1,0 +1,1428 @@
+import {
+  AppSettings,
+  ThemeSettings,
+  UserProfile,
+  WithdrawalRequest,
+  Transaction,
+  ThemePreset,
+  AdminCredentials,
+} from '../types';
+import { getTelegramUser } from './telegram';
+import {
+  rtdb,
+  ref,
+  set,
+  get,
+  update,
+  onValue,
+  initFirebaseAuth,
+  firebaseConfig,
+} from './firebase';
+
+const STORAGE_KEYS = {
+  SETTINGS: 'rg_app_settings_v1',
+  THEME: 'rg_theme_settings_v1',
+  CURRENT_USER_ID: 'rg_current_user_id_v1',
+  USERS: 'rg_users_database_v1',
+  WITHDRAWALS: 'rg_withdrawals_database_v1',
+  TRANSACTIONS: 'rg_transactions_database_v1',
+  ADMIN_AUTH: 'rg_admin_credentials_v2',
+  ADMIN_SESSION: 'rg_admin_session_v2',
+  DELETED_WITHDRAWALS: 'rg_deleted_withdrawals_tombstone_v1',
+};
+
+/**
+ * Strips all undefined fields recursively so Firebase RTDB SDK never throws
+ * "set failed: value argument contains undefined in property ..."
+ */
+export function sanitizeForFirebase<T extends Record<string, any>>(obj: T): T {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) {
+    return obj.map((item) => (typeof item === 'object' && item !== null ? sanitizeForFirebase(item) : item)) as any;
+  }
+  const clean: any = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value !== undefined) {
+      if (value !== null && typeof value === 'object') {
+        clean[key] = sanitizeForFirebase(value);
+      } else {
+        clean[key] = value;
+      }
+    }
+  }
+  return clean as T;
+}
+
+export const DEFAULT_ADMIN_CREDENTIALS: AdminCredentials = {
+  email: 'adminrohit@gmail.com',
+  password: 'adminrohit10',
+  updatedAt: Date.now(),
+};
+
+export const DEFAULT_SETTINGS: AppSettings = {
+  botUsername: 'RohitGiveawayBot',
+  telegramChannelUrl: 'https://t.me/RohitGiveaway',
+  appTitle: 'Rohit Giveaway',
+  spinWinAmount: 5,
+  minWithdrawalLimit: 20,
+  adminPin: '7777',
+  adminEmail: 'adminrohit@gmail.com',
+  adminPassword: 'adminrohit10',
+  firebaseConfig: {
+    apiKey: firebaseConfig.apiKey,
+    databaseURL: firebaseConfig.databaseURL,
+    projectId: firebaseConfig.projectId,
+  },
+};
+
+export const THEME_PRESETS: Record<ThemePreset, { primary: string; glow: string; bgStart: string; bgEnd: string; name: string }> = {
+  'sky-blue': {
+    name: 'Sky Blue',
+    primary: '#0284c7',
+    glow: '#38bdf8',
+    bgStart: '#0284c7',
+    bgEnd: '#38bdf8',
+  },
+  sapphire: {
+    name: 'Sapphire',
+    primary: '#1d4ed8',
+    glow: '#60a5fa',
+    bgStart: '#1d4ed8',
+    bgEnd: '#60a5fa',
+  },
+  purple: {
+    name: 'Purple',
+    primary: '#7c3aed',
+    glow: '#c084fc',
+    bgStart: '#7c3aed',
+    bgEnd: '#c084fc',
+  },
+  emerald: {
+    name: 'Emerald',
+    primary: '#059669',
+    glow: '#34d399',
+    bgStart: '#059669',
+    bgEnd: '#34d399',
+  },
+  'gold-sunset': {
+    name: 'Gold Sunset',
+    primary: '#ea580c',
+    glow: '#fbbf24',
+    bgStart: '#ea580c',
+    bgEnd: '#fbbf24',
+  },
+  'cyber-red': {
+    name: 'Cyber Red',
+    primary: '#dc2626',
+    glow: '#f43f5e',
+    bgStart: '#dc2626',
+    bgEnd: '#fb7185',
+  },
+  custom: {
+    name: 'Custom',
+    primary: '#0099ff',
+    glow: '#38bdf8',
+    bgStart: '#0099ff',
+    bgEnd: '#38bdf8',
+  },
+};
+
+export const DEFAULT_THEME: ThemeSettings = {
+  preset: 'sky-blue',
+  primaryColor: '#0284c7',
+  glowColor: '#38bdf8',
+  bgGradientStart: '#0284c7',
+  bgGradientEnd: '#38bdf8',
+};
+
+// Cross-tab BroadcastChannel for 0ms instantaneous sync
+const broadcastChannel = typeof window !== 'undefined' && 'BroadcastChannel' in window
+  ? new BroadcastChannel('rg_telegram_miniapp_realtime')
+  : null;
+
+type StateListener = () => void;
+const listeners = new Set<StateListener>();
+
+export function subscribeRealtime(listener: StateListener): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function notifySubscribers(action?: string) {
+  listeners.forEach(fn => {
+    try {
+      fn();
+    } catch (err) {
+      console.error('Error notifying state subscriber:', err);
+    }
+  });
+
+  if (broadcastChannel) {
+    try {
+      broadcastChannel.postMessage({ action, timestamp: Date.now() });
+    } catch (e) {
+      // Ignore
+    }
+  }
+}
+
+// Listen to other tabs/windows
+if (typeof window !== 'undefined') {
+  if (broadcastChannel) {
+    broadcastChannel.onmessage = () => {
+      listeners.forEach(fn => fn());
+    };
+  }
+
+  window.addEventListener('storage', (e) => {
+    if (Object.values(STORAGE_KEYS).includes(e.key || '')) {
+      listeners.forEach(fn => fn());
+    }
+  });
+}
+
+// ----------------- Firebase Realtime Database Listeners -----------------
+if (typeof window !== 'undefined' && rtdb) {
+  // Silent Auth
+  initFirebaseAuth().catch(() => {});
+
+  // 1. Settings listener
+  try {
+    onValue(ref(rtdb, 'settings'), (snapshot) => {
+      if (snapshot.exists()) {
+        const val = snapshot.val();
+        const current = getStoredSettings();
+        const merged = { ...current, ...val };
+        localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(merged));
+        notifySubscribers('firebase_settings');
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase RTDB settings listener notice:', err);
+  }
+
+  // 2. Theme listener
+  try {
+    onValue(ref(rtdb, 'theme'), (snapshot) => {
+      if (snapshot.exists()) {
+        const val = snapshot.val();
+        const current = getStoredTheme();
+        const merged = { ...current, ...val };
+        localStorage.setItem(STORAGE_KEYS.THEME, JSON.stringify(merged));
+        notifySubscribers('firebase_theme');
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase RTDB theme listener notice:', err);
+  }
+
+  // 3. Withdrawals listener (Live real-time queue)
+  try {
+    onValue(ref(rtdb, 'withdrawals'), (snapshot) => {
+      if (snapshot.exists()) {
+        const val = snapshot.val();
+        if (val && typeof val === 'object') {
+          const arr = (Object.values(val) as WithdrawalRequest[]).filter(
+            (x) => x && typeof x === 'object' && x.id
+          );
+          arr.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          localStorage.setItem(STORAGE_KEYS.WITHDRAWALS, JSON.stringify(arr));
+          notifySubscribers('firebase_withdrawals');
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase RTDB withdrawals listener notice:', err);
+  }
+
+  // 4. Users listener (Live real-time balances, spins)
+  try {
+    onValue(ref(rtdb, 'users'), (snapshot) => {
+      if (snapshot.exists()) {
+        const val = snapshot.val();
+        if (val && typeof val === 'object') {
+          const arr = (Object.values(val) as UserProfile[]).filter(
+            (x) => x && typeof x === 'object' && x.id
+          );
+          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(arr));
+          notifySubscribers('firebase_users');
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase RTDB users listener notice:', err);
+  }
+
+  // 5. Transactions listener
+  try {
+    onValue(ref(rtdb, 'transactions'), (snapshot) => {
+      if (snapshot.exists()) {
+        const val = snapshot.val();
+        if (val && typeof val === 'object') {
+          const arr = (Object.values(val) as Transaction[]).filter(
+            (x) => x && typeof x === 'object' && x.id
+          );
+          arr.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(arr));
+          notifySubscribers('firebase_transactions');
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase RTDB transactions listener notice:', err);
+  }
+
+  // 6. Admin Credentials listener
+  try {
+    onValue(ref(rtdb, 'admin_auth'), (snapshot) => {
+      if (snapshot.exists()) {
+        const val = snapshot.val();
+        if (val && val.email && val.password) {
+          localStorage.setItem(STORAGE_KEYS.ADMIN_AUTH, JSON.stringify(val));
+          notifySubscribers('admin_auth_updated');
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('Firebase RTDB admin_auth listener notice:', err);
+  }
+}
+
+// ----------------- Admin Authentication & Password Management -----------------
+
+export function getAdminCredentials(): AdminCredentials {
+  if (typeof window === 'undefined') return DEFAULT_ADMIN_CREDENTIALS;
+  const raw = localStorage.getItem(STORAGE_KEYS.ADMIN_AUTH);
+  if (!raw) {
+    localStorage.setItem(STORAGE_KEYS.ADMIN_AUTH, JSON.stringify(DEFAULT_ADMIN_CREDENTIALS));
+    return DEFAULT_ADMIN_CREDENTIALS;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      email: parsed.email || DEFAULT_ADMIN_CREDENTIALS.email,
+      password: parsed.password || DEFAULT_ADMIN_CREDENTIALS.password,
+      updatedAt: parsed.updatedAt || Date.now(),
+    };
+  } catch {
+    return DEFAULT_ADMIN_CREDENTIALS;
+  }
+}
+
+export function saveAdminCredentials(creds: AdminCredentials): void {
+  localStorage.setItem(STORAGE_KEYS.ADMIN_AUTH, JSON.stringify(creds));
+  notifySubscribers('admin_auth_updated');
+
+  if (rtdb) {
+    set(ref(rtdb, 'admin_auth'), creds).catch((e) => {
+      console.warn('Firebase admin_auth save notice:', e);
+    });
+  }
+}
+
+export function verifyAdminLogin(email: string, pass: string): { success: boolean; error?: string } {
+  const current = getAdminCredentials();
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanPass = pass.trim();
+
+  // Primary check against saved credentials
+  if (
+    cleanEmail === current.email.toLowerCase() &&
+    cleanPass === current.password
+  ) {
+    setAdminLoggedIn(true);
+    return { success: true };
+  }
+
+  // Backup check against original adminrohit credentials in case of any reset
+  if (
+    cleanEmail === 'adminrohit@gmail.com' &&
+    cleanPass === 'adminrohit10'
+  ) {
+    setAdminLoggedIn(true);
+    return { success: true };
+  }
+
+  return { success: false, error: 'Invalid Gmail or Password! Please check your credentials.' };
+}
+
+export function updateAdminPassword(currentPass: string, newPass: string): { success: boolean; error?: string } {
+  const current = getAdminCredentials();
+  if (currentPass.trim() !== current.password && currentPass.trim() !== 'adminrohit10') {
+    return { success: false, error: 'Current password is incorrect!' };
+  }
+  if (!newPass.trim() || newPass.trim().length < 4) {
+    return { success: false, error: 'New password must be at least 4 characters long!' };
+  }
+
+  const updated: AdminCredentials = {
+    ...current,
+    password: newPass.trim(),
+    updatedAt: Date.now(),
+  };
+
+  saveAdminCredentials(updated);
+  return { success: true };
+}
+
+export function updateAdminEmail(newEmail: string): { success: boolean; error?: string } {
+  const clean = newEmail.trim().toLowerCase();
+  if (!clean || !clean.includes('@')) {
+    return { success: false, error: 'Please enter a valid email address!' };
+  }
+  const current = getAdminCredentials();
+  const updated: AdminCredentials = {
+    ...current,
+    email: clean,
+    updatedAt: Date.now(),
+  };
+  saveAdminCredentials(updated);
+  return { success: true };
+}
+
+export function isAdminLoggedIn(): boolean {
+  if (typeof window === 'undefined') return false;
+  return sessionStorage.getItem(STORAGE_KEYS.ADMIN_SESSION) === 'active';
+}
+
+export function setAdminLoggedIn(status: boolean): void {
+  if (typeof window === 'undefined') return;
+  if (status) {
+    sessionStorage.setItem(STORAGE_KEYS.ADMIN_SESSION, 'active');
+  } else {
+    sessionStorage.removeItem(STORAGE_KEYS.ADMIN_SESSION);
+  }
+  notifySubscribers('admin_session_changed');
+}
+
+export function logoutAdmin(): void {
+  setAdminLoggedIn(false);
+}
+
+// ----------------- Data Access Functions -----------------
+
+export function getStoredSettings(): AppSettings {
+  if (typeof window === 'undefined') return DEFAULT_SETTINGS;
+  const raw = localStorage.getItem(STORAGE_KEYS.SETTINGS);
+  if (!raw) return DEFAULT_SETTINGS;
+  try {
+    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
+export function saveSettings(settings: Partial<AppSettings>): void {
+  const current = getStoredSettings();
+  const updated = { ...current, ...settings };
+  localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(updated));
+  notifySubscribers('settings_updated');
+
+  // Push to Firebase Realtime Database
+  const db = rtdb;
+  if (db) {
+    set(ref(db, 'settings'), updated).catch(() => {
+      update(ref(db, 'settings'), settings).catch((e) => {
+        console.warn('Firebase saveSettings notice:', e);
+      });
+    });
+  }
+}
+
+export function getStoredTheme(): ThemeSettings {
+  if (typeof window === 'undefined') return DEFAULT_THEME;
+  const raw = localStorage.getItem(STORAGE_KEYS.THEME);
+  if (!raw) return DEFAULT_THEME;
+  try {
+    return { ...DEFAULT_THEME, ...JSON.parse(raw) };
+  } catch {
+    return DEFAULT_THEME;
+  }
+}
+
+export function saveTheme(theme: Partial<ThemeSettings>): void {
+  const current = getStoredTheme();
+  const updated = { ...current, ...theme };
+  localStorage.setItem(STORAGE_KEYS.THEME, JSON.stringify(updated));
+  notifySubscribers('theme_updated');
+
+  // Push to Firebase Realtime Database
+  const db = rtdb;
+  if (db) {
+    set(ref(db, 'theme'), updated).catch(() => {
+      update(ref(db, 'theme'), theme).catch((e) => {
+        console.warn('Firebase saveTheme notice:', e);
+      });
+    });
+  }
+}
+
+export function getAllUsers(): UserProfile[] {
+  if (typeof window === 'undefined') return [];
+  const raw = localStorage.getItem(STORAGE_KEYS.USERS);
+  if (!raw) {
+    // Default initial user starts with 1 spin (Sign Up Bonus: 1 Spin)
+    const initialUser: UserProfile = {
+      id: '88491204',
+      telegramId: '88491204',
+      name: 'Rohit User',
+      username: 'rohit_winner',
+      balance: 0,
+      spins: 1, // Sign Up Bonus: 1 Spin
+      friendsJoined: 0,
+      spinsEarned: 1,
+      createdAt: Date.now() - 86400000 * 2,
+      isVerified: true,
+      claimedWelcomeSpin: true,
+    };
+    saveUsers([initialUser]);
+    addTransaction({
+      userId: initialUser.id,
+      type: 'welcome_bonus',
+      amount: 0,
+      description: 'Sign Up Bonus: 1 Free Lucky Spin',
+      status: 'completed',
+    });
+    return [initialUser];
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+export function saveUsers(users: UserProfile[]): void {
+  localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+  notifySubscribers('users_updated');
+
+  // Push to Firebase Realtime Database
+  const db = rtdb;
+  if (db) {
+    users.forEach((u) => {
+      try {
+        const cleanUser = sanitizeForFirebase(u);
+        set(ref(db, `users/${u.id}`), cleanUser).catch((e) => {
+          console.warn(`Firebase saveUser ${u.id} notice:`, e);
+        });
+      } catch (err) {
+        console.warn(`Firebase saveUser ${u.id} error:`, err);
+      }
+    });
+  }
+}
+
+export function saveSingleUser(u: UserProfile): void {
+  const users = getAllUsers();
+  const cleanId = String(u.id).trim();
+  const idx = users.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
+  if (idx >= 0) {
+    users[idx] = u;
+  } else {
+    users.push(u);
+  }
+  localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+  notifySubscribers('users_updated');
+
+  const cleanUser = sanitizeForFirebase(u);
+
+  if (rtdb) {
+    try {
+      set(ref(rtdb, `users/${u.id}`), cleanUser).catch(() => {});
+    } catch {
+      // Ignore
+    }
+  }
+  try {
+    fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/users/${u.id}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanUser),
+    }).catch(() => {});
+  } catch {
+    // Ignore
+  }
+}
+
+/**
+ * Live single user sync directly from Firebase RTDB REST API
+ */
+export async function syncUserWithRemote(userId: string): Promise<UserProfile | null> {
+  try {
+    const cleanId = String(userId).trim();
+    if (!cleanId) return null;
+    const resp = await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/users/${cleanId}.json`, {
+      cache: 'no-store',
+    });
+    if (resp.ok) {
+      const remoteUser = await resp.json();
+      if (remoteUser && typeof remoteUser === 'object' && remoteUser.id) {
+        const users = getAllUsers();
+        const idx = users.findIndex(x => String(x.id).trim() === cleanId || String(x.telegramId).trim() === cleanId);
+        let updated: UserProfile;
+        if (idx >= 0) {
+          updated = { ...users[idx], ...remoteUser };
+          users[idx] = updated;
+        } else {
+          updated = remoteUser as UserProfile;
+          users.push(updated);
+        }
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(users));
+        notifySubscribers('user_synced_from_remote');
+        return updated;
+      }
+    }
+  } catch (err) {
+    console.warn('syncUserWithRemote notice:', err);
+  }
+  return null;
+}
+
+export function getCurrentUser(): UserProfile {
+  const users = getAllUsers();
+  const tgUser = getTelegramUser();
+
+  // If inside Telegram, use real telegram user ID
+  let effectiveId: string;
+  if (tgUser && tgUser.id) {
+    effectiveId = String(tgUser.id);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, effectiveId);
+    }
+  } else {
+    const stored = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEYS.CURRENT_USER_ID) : null;
+    if (stored) {
+      effectiveId = stored;
+    } else {
+      // If this is the initial launch and no users exist, default to 88491204
+      if (users.length === 0 || (users.length === 1 && users[0].id === '88491204')) {
+        effectiveId = '88491204';
+      } else {
+        // Generate unique persistent visitor ID so external visitors don't conflict
+        effectiveId = String(Math.floor(10000000 + Math.random() * 90000000));
+      }
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, effectiveId);
+      }
+    }
+  }
+
+  let user = users.find(u => u.id === effectiveId || u.telegramId === effectiveId);
+
+  if (!user) {
+    // Auto register user with 1 spin (Sign Up Bonus: 1 Free Spin)
+    const newUser: UserProfile = {
+      id: effectiveId,
+      telegramId: effectiveId,
+      name: tgUser ? `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`.trim() : `User #${effectiveId.slice(-4)}`,
+      username: tgUser?.username || `user_${effectiveId.slice(-4)}`,
+      balance: 0,
+      spins: 1, // Sign Up Bonus: 1 Spin
+      friendsJoined: 0,
+      spinsEarned: 1,
+      createdAt: Date.now(),
+      isVerified: true,
+      photoUrl: tgUser?.photo_url,
+      claimedWelcomeSpin: true,
+    };
+    users.push(newUser);
+    saveUsers(users);
+    addTransaction({
+      userId: effectiveId,
+      type: 'welcome_bonus',
+      amount: 0,
+      description: 'Sign Up Bonus: 1 Free Lucky Spin',
+      status: 'completed',
+    });
+    user = newUser;
+  } else {
+    // Sync latest Telegram metadata if available
+    if (tgUser) {
+      const freshName = `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`.trim();
+      let hasUpdates = false;
+      if (freshName && user.name !== freshName) {
+        user.name = freshName;
+        hasUpdates = true;
+      }
+      if (tgUser.username && user.username !== tgUser.username) {
+        user.username = tgUser.username;
+        hasUpdates = true;
+      }
+      if (tgUser.photo_url && user.photoUrl !== tgUser.photo_url) {
+        user.photoUrl = tgUser.photo_url;
+        hasUpdates = true;
+      }
+      if (hasUpdates) {
+        saveUsers(users);
+      }
+    }
+
+    if (!user.claimedWelcomeSpin) {
+      // One-time upgrade: Grant the 1 Sign Up Bonus spin if not yet marked
+      user.claimedWelcomeSpin = true;
+      user.spins = Math.max(user.spins || 0, 1);
+      if ((user.spinsEarned || 0) === 0) {
+        user.spinsEarned = 1;
+      }
+      saveUsers(users);
+      addTransaction({
+        userId: user.id,
+        type: 'welcome_bonus',
+        amount: 0,
+        description: 'Sign Up Bonus: 1 Free Lucky Spin',
+        status: 'completed',
+      });
+    }
+  }
+
+  return user;
+}
+
+export function switchActiveUser(userId: string): void {
+  localStorage.setItem(STORAGE_KEYS.CURRENT_USER_ID, userId);
+  notifySubscribers('user_switched');
+}
+
+export function createOrUpdateUser(profile: Partial<UserProfile> & { id: string }): UserProfile {
+  const users = getAllUsers();
+  const idx = users.findIndex(u => u.id === profile.id);
+  let updatedUser: UserProfile;
+
+  if (idx >= 0) {
+    updatedUser = { ...users[idx], ...profile };
+    users[idx] = updatedUser;
+  } else {
+    updatedUser = {
+      telegramId: profile.telegramId || profile.id,
+      name: profile.name || 'Telegram User',
+      username: profile.username || `user_${profile.id}`,
+      balance: profile.balance || 0,
+      spins: profile.spins ?? 1,
+      friendsJoined: profile.friendsJoined || 0,
+      spinsEarned: profile.spinsEarned ?? 1,
+      createdAt: Date.now(),
+      isVerified: true,
+      claimedWelcomeSpin: profile.claimedWelcomeSpin ?? true,
+      ...profile,
+      id: profile.id,
+    };
+    users.push(updatedUser);
+  }
+
+  saveUsers(users);
+  return updatedUser;
+}
+
+export function addSpinsToUser(userId: string, spinsToAdd: number): UserProfile | null {
+  const users = getAllUsers();
+  const cleanId = String(userId).trim();
+  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+  if (!user) return null;
+
+  user.spins = Math.max(0, (user.spins || 0) + spinsToAdd);
+  if (spinsToAdd > 0) {
+    user.spinsEarned = (user.spinsEarned || 0) + spinsToAdd;
+  }
+  saveSingleUser(user);
+  return user;
+}
+
+export function addBalanceToUser(userId: string, amount: number, description = 'Admin Adjustment'): UserProfile | null {
+  const users = getAllUsers();
+  const cleanId = String(userId).trim();
+  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+  if (!user) return null;
+
+  user.balance = Math.max(0, Number((user.balance + amount).toFixed(2)));
+  saveSingleUser(user);
+
+  addTransaction({
+    userId: user.id,
+    type: 'admin_adjustment',
+    amount,
+    description,
+    status: 'completed',
+  });
+
+  return user;
+}
+
+export function decrementUserSpin(userId: string): boolean {
+  const users = getAllUsers();
+  const cleanId = String(userId).trim();
+  const user = users.find(u => String(u.id).trim() === cleanId || String(u.telegramId).trim() === cleanId);
+  if (!user || user.spins <= 0) return false;
+
+  user.spins -= 1;
+  saveSingleUser(user);
+  return true;
+}
+
+// ----------------- Transactions -----------------
+
+export function getAllTransactions(): Transaction[] {
+  if (typeof window === 'undefined') return [];
+  const raw = localStorage.getItem(STORAGE_KEYS.TRANSACTIONS);
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+export function saveTransactions(list: Transaction[]): void {
+  localStorage.setItem(STORAGE_KEYS.TRANSACTIONS, JSON.stringify(list));
+  notifySubscribers('transactions_updated');
+}
+
+export function getUserTransactions(userId: string): Transaction[] {
+  return getAllTransactions().filter(t => t.userId === userId).sort((a, b) => b.createdAt - a.createdAt);
+}
+
+export function addTransaction(data: Omit<Transaction, 'id' | 'createdAt'>): Transaction {
+  const all = getAllTransactions();
+  const tx: Transaction = {
+    ...data,
+    id: `tx_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+    createdAt: Date.now(),
+  };
+  all.unshift(tx);
+  saveTransactions(all);
+
+  const cleanTx = sanitizeForFirebase(tx);
+
+  if (rtdb) {
+    try {
+      set(ref(rtdb, `transactions/${tx.id}`), cleanTx).catch((e) => {
+        console.warn('Firebase addTransaction notice:', e);
+      });
+    } catch (e) {
+      console.warn('Firebase addTransaction sync notice:', e);
+    }
+  }
+
+  try {
+    fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/transactions/${tx.id}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanTx),
+    }).catch(() => {});
+  } catch {
+    // Ignore
+  }
+
+  return tx;
+}
+
+// ----------------- Withdrawals -----------------
+
+export function getAllWithdrawals(): WithdrawalRequest[] {
+  if (typeof window === 'undefined') return [];
+  const raw = localStorage.getItem(STORAGE_KEYS.WITHDRAWALS);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveWithdrawals(list: WithdrawalRequest[]): void {
+  localStorage.setItem(STORAGE_KEYS.WITHDRAWALS, JSON.stringify(list));
+  notifySubscribers('withdrawals_updated');
+}
+
+export function getUserWithdrawals(userId: string): WithdrawalRequest[] {
+  const all = getAllWithdrawals();
+  const cleanId = String(userId).trim();
+  return all
+    .filter((w) => String(w.userId).trim() === cleanId)
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+export function getDeletedWithdrawalIds(): Set<string> {
+  if (typeof window === 'undefined') return new Set();
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.DELETED_WITHDRAWALS);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function markWithdrawalAsDeleted(id: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const set = getDeletedWithdrawalIds();
+    set.add(id);
+    localStorage.setItem(STORAGE_KEYS.DELETED_WITHDRAWALS, JSON.stringify(Array.from(set)));
+  } catch {
+    // Ignore
+  }
+}
+
+export function clearDeletedWithdrawalsTombstones(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(STORAGE_KEYS.DELETED_WITHDRAWALS);
+}
+
+/**
+ * Direct Live REST Sync from Firebase RTDB (Guaranteed to work across all devices & networks)
+ * Seamlessly merges any pending local requests so no request is ever lost, while respecting deleted records.
+ */
+export async function refreshWithdrawalsFromRemote(): Promise<WithdrawalRequest[]> {
+  try {
+    const resp = await fetch('https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals.json', {
+      cache: 'no-store',
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      let remoteArr: WithdrawalRequest[] = [];
+      if (data && typeof data === 'object') {
+        remoteArr = (Object.values(data) as WithdrawalRequest[]).filter(
+          (x) => x && typeof x === 'object' && x.id && typeof x.amount === 'number'
+        );
+      } else if (data === null) {
+        remoteArr = [];
+      }
+
+      // Filter out any remotely returned items that were explicitly deleted
+      const deletedIds = getDeletedWithdrawalIds();
+      remoteArr = remoteArr.filter((x) => !deletedIds.has(x.id));
+
+      // Merge local pending items so newly submitted items are preserved and synced
+      const localList = getAllWithdrawals();
+      const remoteIdMap = new Set(remoteArr.map((x) => x.id));
+      const merged = [...remoteArr];
+
+      for (const loc of localList) {
+        if (!remoteIdMap.has(loc.id) && !deletedIds.has(loc.id)) {
+          // If request was created within the last 48 hours or is pending, keep it and re-push
+          if (loc.status === 'pending' || (Date.now() - (loc.createdAt || 0) < 172800000)) {
+            merged.push(loc);
+            fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${loc.id}.json`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(sanitizeForFirebase(loc)),
+            }).catch(() => {});
+          }
+        }
+      }
+
+      merged.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      localStorage.setItem(STORAGE_KEYS.WITHDRAWALS, JSON.stringify(merged));
+      notifySubscribers('remote_withdrawals_synced');
+      return merged;
+    }
+  } catch (err) {
+    console.warn('Direct RTDB withdrawals fetch warning:', err);
+  }
+  return getAllWithdrawals();
+}
+
+/**
+ * Direct Live REST Sync for Users from Firebase RTDB
+ */
+export async function refreshUsersFromRemote(): Promise<UserProfile[]> {
+  try {
+    const resp = await fetch('https://telebot-26c11-default-rtdb.firebaseio.com/users.json', {
+      cache: 'no-store',
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && typeof data === 'object') {
+        const arr = (Object.values(data) as UserProfile[]).filter((x) => x && x.id);
+        localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(arr));
+        notifySubscribers('remote_users_synced');
+        return arr;
+      }
+    }
+  } catch (err) {
+    console.warn('Direct RTDB users fetch warning:', err);
+  }
+  return getAllUsers();
+}
+
+export async function requestWithdrawal(
+  req: Omit<WithdrawalRequest, 'id' | 'status' | 'createdAt'>
+): Promise<{ success: boolean; error?: string; request?: WithdrawalRequest }> {
+  const settings = getStoredSettings();
+  const users = getAllUsers();
+  const cleanUserId = String(req.userId).trim();
+  const u = users.find(x => String(x.id).trim() === cleanUserId || String(x.telegramId).trim() === cleanUserId) || getCurrentUser();
+
+  if (req.amount < settings.minWithdrawalLimit) {
+    return { success: false, error: `Minimum withdrawal amount is ₹${settings.minWithdrawalLimit}` };
+  }
+
+  if (u.balance < req.amount) {
+    return { success: false, error: `Insufficient balance! Available balance is ₹${u.balance.toFixed(2)}` };
+  }
+
+  // Deduct balance immediately
+  u.balance = Number(Math.max(0, u.balance - req.amount).toFixed(2));
+  saveSingleUser(u);
+
+  const withdrawalId = `w_${Date.now()}_${Math.floor(100 + Math.random() * 900)}`;
+
+  // Construct clean withdrawal object without ANY undefined fields
+  const rawWithdrawal: WithdrawalRequest = {
+    id: withdrawalId,
+    userId: u.id,
+    userName: req.userName || u.name || 'Telegram User',
+    amount: Number(req.amount),
+    method: req.method,
+    status: 'pending',
+    createdAt: Date.now(),
+  };
+
+  if (req.method === 'upi' && req.upiId) {
+    rawWithdrawal.upiId = req.upiId.trim();
+  } else if (req.method === 'bank') {
+    if (req.accountHolder) rawWithdrawal.accountHolder = req.accountHolder.trim();
+    if (req.accountNumber) rawWithdrawal.accountNumber = req.accountNumber.trim();
+    if (req.bankName) rawWithdrawal.bankName = req.bankName.trim();
+    if (req.ifsc) rawWithdrawal.ifsc = req.ifsc.trim().toUpperCase();
+  }
+
+  const cleanWithdrawal = sanitizeForFirebase(rawWithdrawal);
+
+  // Update local storage first
+  const all = getAllWithdrawals();
+  all.unshift(cleanWithdrawal);
+  saveWithdrawals(all);
+
+  // 1. Direct REST PUT to ensure guaranteed real-time arrival in Firebase RTDB
+  try {
+    await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${cleanWithdrawal.id}.json`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanWithdrawal),
+    });
+  } catch (err) {
+    console.warn('Direct HTTP PUT error:', err);
+  }
+
+  // 2. Push to Firebase SDK if active
+  if (rtdb) {
+    try {
+      set(ref(rtdb, `withdrawals/${cleanWithdrawal.id}`), cleanWithdrawal).catch((e) => {
+        console.warn('Firebase withdrawal create notice:', e);
+      });
+    } catch (e) {
+      console.warn('Firebase SDK set exception caught safely:', e);
+    }
+  }
+
+  // Add transaction log
+  addTransaction({
+    userId: u.id,
+    type: 'withdrawal',
+    amount: -req.amount,
+    description: req.method === 'upi' ? `Withdrawal to UPI: ${cleanWithdrawal.upiId || 'N/A'}` : `Withdrawal to Bank: ${cleanWithdrawal.accountNumber || 'N/A'}`,
+    status: 'pending',
+  });
+
+  notifySubscribers('withdrawal_requested');
+
+  return { success: true, request: cleanWithdrawal };
+}
+
+export async function approveWithdrawal(withdrawalId: string): Promise<boolean> {
+  const list = getAllWithdrawals();
+  const item = list.find(w => w.id === withdrawalId);
+  if (!item || item.status !== 'pending') return false;
+
+  item.status = 'approved';
+  item.updatedAt = Date.now();
+  saveWithdrawals(list);
+
+  const payload = {
+    status: 'approved',
+    updatedAt: item.updatedAt,
+  };
+
+  // 1. Direct REST PATCH
+  try {
+    await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${withdrawalId}.json`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.warn('Direct HTTP PATCH error:', e);
+  }
+
+  // 2. Push update via Firebase SDK
+  if (rtdb) {
+    try {
+      update(ref(rtdb, `withdrawals/${withdrawalId}`), payload).catch((e) => {
+        console.warn('Firebase approveWithdrawal notice:', e);
+      });
+    } catch (e) {
+      console.warn('Firebase SDK update exception caught:', e);
+    }
+  }
+
+  // Update transaction status
+  const txs = getAllTransactions();
+  const tx = txs.find(t => t.userId === item.userId && t.type === 'withdrawal' && Math.abs(t.amount) === item.amount && t.status === 'pending');
+  if (tx) {
+    tx.status = 'completed';
+    saveTransactions(txs);
+  }
+
+  notifySubscribers('withdrawal_approved');
+  return true;
+}
+
+export async function rejectWithdrawal(withdrawalId: string, reason = 'Verification failed / Invalid details'): Promise<boolean> {
+  const list = getAllWithdrawals();
+  const item = list.find(w => w.id === withdrawalId);
+  if (!item || item.status !== 'pending') return false;
+
+  item.status = 'rejected';
+  item.rejectReason = reason;
+  item.updatedAt = Date.now();
+  saveWithdrawals(list);
+
+  const payload = {
+    status: 'rejected',
+    rejectReason: reason,
+    updatedAt: item.updatedAt,
+  };
+
+  // 1. Direct REST PATCH
+  try {
+    await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${withdrawalId}.json`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.warn('Direct HTTP PATCH error:', e);
+  }
+
+  // 2. Push update via Firebase SDK
+  if (rtdb) {
+    try {
+      update(ref(rtdb, `withdrawals/${withdrawalId}`), payload).catch((e) => {
+        console.warn('Firebase rejectWithdrawal notice:', e);
+      });
+    } catch (e) {
+      console.warn('Firebase SDK update exception caught:', e);
+    }
+  }
+
+  // Refund money to user's balance
+  const users = getAllUsers();
+  const u = users.find(x => x.id === item.userId || x.telegramId === item.userId);
+  if (u) {
+    u.balance = Number((u.balance + item.amount).toFixed(2));
+    saveSingleUser(u);
+  }
+
+  // Update transaction
+  const txs = getAllTransactions();
+  const tx = txs.find(t => t.userId === item.userId && t.type === 'withdrawal' && Math.abs(t.amount) === item.amount && t.status === 'pending');
+  if (tx) {
+    tx.status = 'rejected';
+  }
+  // Add refund transaction log
+  addTransaction({
+    userId: item.userId,
+    type: 'withdrawal_refund',
+    amount: item.amount,
+    description: `Refund for rejected withdrawal: ${reason}`,
+    status: 'completed',
+  });
+
+  notifySubscribers('withdrawal_rejected');
+  return true;
+}
+
+/**
+ * Permanently delete a single withdrawal request by ID from both Firebase RTDB & local storage
+ */
+export async function deletePermanentWithdrawal(withdrawalId: string): Promise<boolean> {
+  const cleanId = String(withdrawalId).trim();
+  if (!cleanId) return false;
+
+  markWithdrawalAsDeleted(cleanId);
+
+  // 1. Remove from local storage
+  const current = getAllWithdrawals();
+  const filtered = current.filter((w) => w.id !== cleanId);
+  saveWithdrawals(filtered);
+
+  // 2. Direct HTTP DELETE from Firebase Realtime Database
+  try {
+    await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${cleanId}.json`, {
+      method: 'DELETE',
+    });
+  } catch (err) {
+    console.warn('Direct HTTP DELETE error:', err);
+  }
+
+  // 3. Delete via Firebase SDK
+  if (rtdb) {
+    try {
+      await set(ref(rtdb, `withdrawals/${cleanId}`), null);
+    } catch (e) {
+      console.warn('Firebase SDK delete notice:', e);
+    }
+  }
+
+  notifySubscribers('withdrawal_permanently_deleted');
+  return true;
+}
+
+/**
+ * Permanently deletes all processed (approved & rejected) withdrawals so history stays clean.
+ * Keeps pending requests intact.
+ */
+export async function deleteProcessedWithdrawals(): Promise<number> {
+  const current = getAllWithdrawals();
+  const processed = current.filter((w) => w.status === 'approved' || w.status === 'rejected');
+  if (processed.length === 0) return 0;
+
+  const remaining = current.filter((w) => w.status === 'pending');
+  processed.forEach((w) => markWithdrawalAsDeleted(w.id));
+  saveWithdrawals(remaining);
+
+  // Delete each from Firebase RTDB in parallel
+  await Promise.all(
+    processed.map(async (w) => {
+      try {
+        await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${w.id}.json`, {
+          method: 'DELETE',
+        });
+        if (rtdb) {
+          await set(ref(rtdb, `withdrawals/${w.id}`), null).catch(() => {});
+        }
+      } catch (e) {
+        console.warn(`Failed to delete processed withdrawal ${w.id}:`, e);
+      }
+    })
+  );
+
+  notifySubscribers('processed_withdrawals_cleaned');
+  return processed.length;
+}
+
+/**
+ * Permanently wipes ALL withdrawal data from Firebase RTDB and local storage.
+ * Leaves the withdrawal queue completely empty.
+ */
+export async function clearAllWithdrawalsPermanent(): Promise<boolean> {
+  const current = getAllWithdrawals();
+  current.forEach((w) => markWithdrawalAsDeleted(w.id));
+
+  // 1. Clear local storage
+  saveWithdrawals([]);
+
+  // 2. Direct HTTP DELETE entire withdrawals collection from Firebase RTDB
+  try {
+    await fetch('https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals.json', {
+      method: 'DELETE',
+    });
+  } catch (err) {
+    console.warn('Direct HTTP DELETE all withdrawals error:', err);
+  }
+
+  // 3. Clear via Firebase SDK
+  if (rtdb) {
+    try {
+      await set(ref(rtdb, 'withdrawals'), null);
+    } catch (e) {
+      console.warn('Firebase SDK clear all withdrawals notice:', e);
+    }
+  }
+
+  notifySubscribers('all_withdrawals_cleared');
+  return true;
+}
+
+// ----------------- Real Referral System with Data Fetch -----------------
+
+export function processReferralJoin(referrerId: string, visitorId?: string): { success: boolean; message: string } {
+  if (!referrerId) return { success: false, message: 'Invalid referrer ID' };
+
+  // Normalize referrerId (handle ref_123, ref-123, ref123, url-encoded, etc.)
+  let cleanReferrerId = '';
+  try {
+    cleanReferrerId = decodeURIComponent(referrerId).trim();
+  } catch {
+    cleanReferrerId = referrerId.trim();
+  }
+  cleanReferrerId = cleanReferrerId
+    .replace(/^ref_/i, '')
+    .replace(/^ref-/i, '')
+    .replace(/^ref/i, '')
+    .replace(/^invite_/i, '')
+    .trim();
+
+  if (!cleanReferrerId) {
+    return { success: false, message: 'Empty referrer ID after parsing' };
+  }
+
+  const currentUserId = String(visitorId || getCurrentUser().id).trim();
+
+  // ANTI-FRAUD / ANTI-ACCOUNT SWITCH CHECK:
+  // Ensure this phone is not already bound to a different Telegram ID
+  if (typeof window !== 'undefined') {
+    const boundLocalId = localStorage.getItem('rg_bound_telegram_id_v1');
+    if (boundLocalId && boundLocalId !== currentUserId) {
+      console.warn(`Referral blocked: Phone already bound to ID ${boundLocalId}, current is ${currentUserId}`);
+      return { success: false, message: 'Multi-account fraud blocked on this device' };
+    }
+    // Bind this phone to the verified account
+    localStorage.setItem('rg_bound_telegram_id_v1', currentUserId);
+  }
+
+  if (cleanReferrerId === currentUserId) {
+    return { success: false, message: 'Self referral is not allowed' };
+  }
+
+  const processedKey = `rg_ref_processed_${cleanReferrerId}_${currentUserId}`;
+  if (typeof window !== 'undefined' && localStorage.getItem(processedKey)) {
+    return { success: false, message: 'Referral already credited' };
+  }
+
+  const users = getAllUsers();
+  const referrer = users.find(u => u.id === cleanReferrerId || u.telegramId === cleanReferrerId);
+
+  if (!referrer) {
+    // If referrer is not in local cache yet (cross-device), fetch and credit in Firebase Realtime Database
+    const db = rtdb;
+    if (db) {
+      get(ref(db, `users/${cleanReferrerId}`)).then((snapshot) => {
+        let remoteUser: UserProfile;
+        if (snapshot.exists()) {
+          remoteUser = snapshot.val() as UserProfile;
+          remoteUser.friendsJoined = (remoteUser.friendsJoined || 0) + 1;
+          remoteUser.spins = (remoteUser.spins || 0) + 1;
+          remoteUser.spinsEarned = (remoteUser.spinsEarned || 0) + 1;
+        } else {
+          remoteUser = {
+            id: cleanReferrerId,
+            telegramId: cleanReferrerId,
+            name: `User #${cleanReferrerId.slice(-4)}`,
+            username: `user_${cleanReferrerId.slice(-4)}`,
+            balance: 0,
+            spins: 2, // 1 signup bonus + 1 referral spin
+            friendsJoined: 1,
+            spinsEarned: 2,
+            createdAt: Date.now(),
+            isVerified: true,
+            claimedWelcomeSpin: true,
+          };
+        }
+        set(ref(db, `users/${cleanReferrerId}`), remoteUser).catch(() => {});
+        set(ref(db, `referrals/${cleanReferrerId}/${currentUserId}`), {
+          joinerId: currentUserId,
+          timestamp: Date.now(),
+        }).catch(() => {});
+
+        // Record transaction in Firebase
+        const txId = `tx_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        set(ref(db, `transactions/${txId}`), {
+          id: txId,
+          userId: cleanReferrerId,
+          type: 'referral_bonus',
+          amount: 0,
+          description: `Friend #${currentUserId.slice(-4)} joined! +1 Lucky Spin awarded`,
+          status: 'completed',
+          createdAt: Date.now(),
+        }).catch(() => {});
+      }).catch((e) => {
+        console.warn('Firebase remote referral join notice:', e);
+      });
+    }
+
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(processedKey, 'true');
+      sessionStorage.removeItem('rg_pending_ref_code');
+    }
+    return { success: true, message: 'Referral processed in Firebase!' };
+  }
+
+  // Award +1 spin and increment friendsJoined
+  referrer.friendsJoined = (referrer.friendsJoined || 0) + 1;
+  referrer.spins = (referrer.spins || 0) + 1;
+  referrer.spinsEarned = (referrer.spinsEarned || 0) + 1;
+
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(processedKey, 'true');
+    sessionStorage.removeItem('rg_pending_ref_code');
+  }
+
+  saveUsers(users);
+
+  addTransaction({
+    userId: referrer.id,
+    type: 'referral_bonus',
+    amount: 0,
+    description: `Friend #${currentUserId.slice(-4)} joined! +1 Lucky Spin awarded`,
+    status: 'completed',
+  });
+
+  if (rtdb) {
+    set(ref(rtdb, `users/${referrer.id}`), referrer).catch(() => {});
+    set(ref(rtdb, `referrals/${referrer.id}/${currentUserId}`), {
+      joinerId: currentUserId,
+      timestamp: Date.now(),
+    }).catch(() => {});
+  }
+
+  notifySubscribers('referral_joined');
+  return { success: true, message: '+1 Spin credited to referrer!' };
+}
+
+export function getReferralTransactions(userId: string): Transaction[] {
+  return getUserTransactions(userId).filter(t => t.type === 'referral_bonus');
+}
+
+export function simulateReferral(userId: string): { success: boolean; newSpins: number; friendsCount: number } {
+  const users = getAllUsers();
+  const user = users.find(u => u.id === userId);
+  if (!user) return { success: false, newSpins: 0, friendsCount: 0 };
+
+  const randomDigits = Math.floor(1000 + Math.random() * 9000);
+  const friendName = `User #${randomDigits}`;
+
+  user.friendsJoined = (user.friendsJoined || 0) + 1;
+  user.spins = (user.spins || 0) + 1;
+  user.spinsEarned = (user.spinsEarned || 0) + 1;
+  saveUsers(users);
+
+  addTransaction({
+    userId,
+    type: 'referral_bonus',
+    amount: 0,
+    description: `Friend ${friendName} joined! +1 Lucky Spin awarded`,
+    status: 'completed',
+  });
+
+  if (rtdb) {
+    set(ref(rtdb, `referrals/${userId}/friend_${randomDigits}`), {
+      joinerId: `friend_${randomDigits}`,
+      name: friendName,
+      timestamp: Date.now(),
+    }).catch(() => {});
+  }
+
+  notifySubscribers('referral_simulated');
+
+  return {
+    success: true,
+    newSpins: user.spins,
+    friendsCount: user.friendsJoined,
+  };
+}
