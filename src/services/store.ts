@@ -463,16 +463,16 @@ export function getAllUsers(): UserProfile[] {
   if (typeof window === 'undefined') return [];
   const raw = localStorage.getItem(STORAGE_KEYS.USERS);
   if (!raw) {
-    // Default initial user starts with ₹100 balance for instant withdrawal testing
+    // Default initial user starts with ₹0 balance and 1 free lucky spin
     const initialUser: UserProfile = {
       id: '88491204',
       telegramId: '88491204',
       name: 'Rohit User',
       username: 'rohit_winner',
-      balance: 100,
-      spins: 5,
+      balance: 0,
+      spins: 1, // 1 Free Lucky Spin for all users
       friendsJoined: 0,
-      spinsEarned: 5,
+      spinsEarned: 1,
       createdAt: Date.now() - 86400000 * 2,
       isVerified: true,
       claimedWelcomeSpin: true,
@@ -481,8 +481,8 @@ export function getAllUsers(): UserProfile[] {
     addTransaction({
       userId: initialUser.id,
       type: 'welcome_bonus',
-      amount: 100,
-      description: 'Preview Balance for Withdrawal Testing',
+      amount: 0,
+      description: 'Sign Up Bonus: 1 Free Lucky Spin',
       status: 'completed',
     });
     return [initialUser];
@@ -612,16 +612,16 @@ export function getCurrentUser(): UserProfile {
   let user = users.find(u => u.id === effectiveId || u.telegramId === effectiveId);
 
   if (!user) {
-    // Auto register user with initial ₹100 balance for instant withdrawal testing
+    // Auto register user with ₹0 balance and 1 free lucky spin
     const newUser: UserProfile = {
       id: effectiveId,
       telegramId: effectiveId,
       name: tgUser ? `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`.trim() : `User #${effectiveId.slice(-4)}`,
       username: tgUser?.username || `user_${effectiveId.slice(-4)}`,
-      balance: 100,
-      spins: 5,
+      balance: 0,
+      spins: 1, // 1 Free Lucky Spin for all users
       friendsJoined: 0,
-      spinsEarned: 5,
+      spinsEarned: 1,
       createdAt: Date.now(),
       isVerified: true,
       photoUrl: tgUser?.photo_url,
@@ -632,8 +632,8 @@ export function getCurrentUser(): UserProfile {
     addTransaction({
       userId: effectiveId,
       type: 'welcome_bonus',
-      amount: 100,
-      description: 'Preview Balance for Withdrawal Testing',
+      amount: 0,
+      description: 'Sign Up Bonus: 1 Free Lucky Spin',
       status: 'completed',
     });
     user = newUser;
@@ -675,12 +675,6 @@ export function getCurrentUser(): UserProfile {
         status: 'completed',
       });
     }
-  }
-
-  // Guarantee preview test balance of at least ₹100 so user can test withdrawal immediately
-  if (user && user.balance < 50) {
-    user.balance = 100;
-    saveSingleUser(user);
   }
 
   return user;

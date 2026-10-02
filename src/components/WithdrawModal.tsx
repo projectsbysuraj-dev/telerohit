@@ -163,21 +163,6 @@ export const WithdrawModal: React.FC<WithdrawModalProps> = ({
           </div>
         </div>
 
-        {/* Instant Test Balance button if balance is lower than min limit */}
-        {liveBalance < settings.minWithdrawalLimit && (
-          <button
-            type="button"
-            onClick={() => {
-              addBalanceToUser(user.id, 50);
-              setLiveBalance((prev) => prev + 50);
-              triggerHaptic('success');
-            }}
-            className="w-full mb-3 py-2 px-3 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-700 text-xs font-bold border border-sky-200 flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm"
-          >
-            <span>🎁 Add +₹50 Test Balance (Instant)</span>
-          </button>
-        )}
-
         {/* Method Switcher Tabs */}
         <div className="grid grid-cols-2 gap-1.5 bg-slate-100 p-1 rounded-xl mb-3">
           <button
