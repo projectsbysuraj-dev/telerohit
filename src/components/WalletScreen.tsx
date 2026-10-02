@@ -16,6 +16,7 @@ import {
   getUserWithdrawals,
   refreshWithdrawalsFromRemote,
   subscribeRealtime,
+  addBalanceToUser,
 } from '../services/store';
 import { WithdrawModal } from './WithdrawModal';
 import { TabType } from './BottomNav';
@@ -126,9 +127,21 @@ export const WalletScreen: React.FC<WalletScreenProps> = ({ user, settings, onNa
           ₹ {user.balance.toFixed(2)}
         </h2>
 
-        <p className="text-xs text-slate-300 font-medium mb-6">
+        <p className="text-xs text-slate-300 font-medium mb-4">
           Instant 100% Payout via UPI &amp; Bank Account
         </p>
+
+        {user.balance < settings.minWithdrawalLimit && (
+          <button
+            onClick={() => {
+              triggerHaptic('success');
+              addBalanceToUser(user.id, 50);
+            }}
+            className="w-full mb-4 py-2 px-3 bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/40 rounded-xl text-sky-200 text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-sm"
+          >
+            <span>🎁 Claim +₹50 Test Balance (Instant)</span>
+          </button>
+        )}
 
         {/* Buttons Row */}
         <div className="grid grid-cols-2 gap-3">

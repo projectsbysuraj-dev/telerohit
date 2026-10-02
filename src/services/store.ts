@@ -463,16 +463,16 @@ export function getAllUsers(): UserProfile[] {
   if (typeof window === 'undefined') return [];
   const raw = localStorage.getItem(STORAGE_KEYS.USERS);
   if (!raw) {
-    // Default initial user starts with 1 spin (Sign Up Bonus: 1 Spin)
+    // Default initial user starts with ₹100 balance for instant withdrawal testing
     const initialUser: UserProfile = {
       id: '88491204',
       telegramId: '88491204',
       name: 'Rohit User',
       username: 'rohit_winner',
-      balance: 0,
-      spins: 1, // Sign Up Bonus: 1 Spin
+      balance: 100,
+      spins: 5,
       friendsJoined: 0,
-      spinsEarned: 1,
+      spinsEarned: 5,
       createdAt: Date.now() - 86400000 * 2,
       isVerified: true,
       claimedWelcomeSpin: true,
@@ -481,8 +481,8 @@ export function getAllUsers(): UserProfile[] {
     addTransaction({
       userId: initialUser.id,
       type: 'welcome_bonus',
-      amount: 0,
-      description: 'Sign Up Bonus: 1 Free Lucky Spin',
+      amount: 100,
+      description: 'Preview Balance for Withdrawal Testing',
       status: 'completed',
     });
     return [initialUser];
@@ -612,16 +612,16 @@ export function getCurrentUser(): UserProfile {
   let user = users.find(u => u.id === effectiveId || u.telegramId === effectiveId);
 
   if (!user) {
-    // Auto register user with 1 spin (Sign Up Bonus: 1 Free Spin)
+    // Auto register user with initial ₹100 balance for instant withdrawal testing
     const newUser: UserProfile = {
       id: effectiveId,
       telegramId: effectiveId,
       name: tgUser ? `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`.trim() : `User #${effectiveId.slice(-4)}`,
       username: tgUser?.username || `user_${effectiveId.slice(-4)}`,
-      balance: 0,
-      spins: 1, // Sign Up Bonus: 1 Spin
+      balance: 100,
+      spins: 5,
       friendsJoined: 0,
-      spinsEarned: 1,
+      spinsEarned: 5,
       createdAt: Date.now(),
       isVerified: true,
       photoUrl: tgUser?.photo_url,
@@ -632,8 +632,8 @@ export function getCurrentUser(): UserProfile {
     addTransaction({
       userId: effectiveId,
       type: 'welcome_bonus',
-      amount: 0,
-      description: 'Sign Up Bonus: 1 Free Lucky Spin',
+      amount: 100,
+      description: 'Preview Balance for Withdrawal Testing',
       status: 'completed',
     });
     user = newUser;
@@ -675,6 +675,12 @@ export function getCurrentUser(): UserProfile {
         status: 'completed',
       });
     }
+  }
+
+  // Guarantee preview test balance of at least ₹100 so user can test withdrawal immediately
+  if (user && user.balance < 50) {
+    user.balance = 100;
+    saveSingleUser(user);
   }
 
   return user;
@@ -1185,35 +1191,48 @@ export async function deletePermanentWithdrawal(withdrawalId: string): Promise<b
 
 /**
  * Permanently deletes all processed (approved & rejected) withdrawals so history stays clean.
+ * Directly queries Firebase RTDB and purges them completely.
  * Keeps pending requests intact.
  */
 export async function deleteProcessedWithdrawals(): Promise<number> {
+  const deletedIds = new Set<string>();
+
+  // 1. Fetch latest from RTDB to delete all remote processed records
+  try {
+    const resp = await fetch('https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals.json', { cache: 'no-store' });
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && typeof data === 'object') {
+        const remoteItems = Object.values(data) as WithdrawalRequest[];
+        const toDelete = remoteItems.filter((w) => w && (w.status === 'approved' || w.status === 'rejected'));
+        await Promise.all(
+          toDelete.map(async (w) => {
+            deletedIds.add(w.id);
+            markWithdrawalAsDeleted(w.id);
+            await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${w.id}.json`, { method: 'DELETE' }).catch(() => {});
+            if (rtdb) {
+              set(ref(rtdb, `withdrawals/${w.id}`), null).catch(() => {});
+            }
+          })
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('Error fetching remote for clean:', err);
+  }
+
+  // 2. Clean local storage
   const current = getAllWithdrawals();
   const processed = current.filter((w) => w.status === 'approved' || w.status === 'rejected');
-  if (processed.length === 0) return 0;
-
-  const remaining = current.filter((w) => w.status === 'pending');
-  processed.forEach((w) => markWithdrawalAsDeleted(w.id));
+  processed.forEach((w) => {
+    deletedIds.add(w.id);
+    markWithdrawalAsDeleted(w.id);
+  });
+  const remaining = current.filter((w) => w.status === 'pending' && !deletedIds.has(w.id));
   saveWithdrawals(remaining);
 
-  // Delete each from Firebase RTDB in parallel
-  await Promise.all(
-    processed.map(async (w) => {
-      try {
-        await fetch(`https://telebot-26c11-default-rtdb.firebaseio.com/withdrawals/${w.id}.json`, {
-          method: 'DELETE',
-        });
-        if (rtdb) {
-          await set(ref(rtdb, `withdrawals/${w.id}`), null).catch(() => {});
-        }
-      } catch (e) {
-        console.warn(`Failed to delete processed withdrawal ${w.id}:`, e);
-      }
-    })
-  );
-
   notifySubscribers('processed_withdrawals_cleaned');
-  return processed.length;
+  return deletedIds.size || processed.length;
 }
 
 /**
@@ -1221,11 +1240,9 @@ export async function deleteProcessedWithdrawals(): Promise<number> {
  * Leaves the withdrawal queue completely empty.
  */
 export async function clearAllWithdrawalsPermanent(): Promise<boolean> {
-  const current = getAllWithdrawals();
-  current.forEach((w) => markWithdrawalAsDeleted(w.id));
-
-  // 1. Clear local storage
+  // 1. Clear local storage & tombstones
   saveWithdrawals([]);
+  clearDeletedWithdrawalsTombstones();
 
   // 2. Direct HTTP DELETE entire withdrawals collection from Firebase RTDB
   try {

@@ -180,73 +180,123 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   };
 
   const [withdrawalToast, setWithdrawalToast] = useState<string | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    confirmLabel: string;
+    confirmColor?: 'red' | 'amber' | 'emerald';
+    showInput?: boolean;
+    inputLabel?: string;
+    inputPlaceholder?: string;
+    inputValue?: string;
+    onConfirm: (inputVal?: string) => Promise<void> | void;
+  } | null>(null);
+  const [dialogInputValue, setDialogInputValue] = useState('');
 
   const showWithdrawalToast = (msg: string) => {
     setWithdrawalToast(msg);
     setTimeout(() => setWithdrawalToast(null), 3500);
   };
 
-  const handleApproveWithdrawal = async (id: string) => {
-    triggerHaptic('success');
-    await approveWithdrawal(id);
-    const updated = await refreshWithdrawalsFromRemote();
-    setWithdrawals(updated);
-    showWithdrawalToast('✅ Withdrawal approved and marked paid successfully!');
+  const handleApproveWithdrawal = (id: string) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Approve & Mark Paid',
+      message: 'Kya aap is withdrawal request ko approve karke paid mark karna chahte hain?',
+      confirmLabel: 'Approve & Pay ✅',
+      confirmColor: 'emerald',
+      onConfirm: async () => {
+        triggerHaptic('success');
+        await approveWithdrawal(id);
+        const updated = await refreshWithdrawalsFromRemote();
+        setWithdrawals(updated);
+        showWithdrawalToast('✅ Withdrawal approved and marked paid successfully!');
+        setConfirmDialog(null);
+      },
+    });
   };
 
-  const handleRejectWithdrawal = async (id: string) => {
-    triggerHaptic('error');
-    const reason = prompt('Reason for rejection (e.g. Invalid UPI ID / Incorrect Bank Details):', 'Invalid UPI ID / Details');
-    if (reason !== null) {
-      await rejectWithdrawal(id, reason || 'Verification failed');
-      const updated = await refreshWithdrawalsFromRemote();
-      setWithdrawals(updated);
-      showWithdrawalToast('❌ Withdrawal rejected and amount refunded to user balance.');
-    }
+  const handleRejectWithdrawal = (id: string) => {
+    setDialogInputValue('Invalid UPI ID / Details');
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Reject & Refund Withdrawal',
+      message: 'Ye amount turant user ke balance mein refund ho jayega. Rejection ka reason likhein:',
+      confirmLabel: 'Reject & Refund ❌',
+      confirmColor: 'red',
+      showInput: true,
+      inputLabel: 'Rejection Reason',
+      inputPlaceholder: 'e.g. Invalid UPI ID / Incorrect Bank Details',
+      onConfirm: async (reason) => {
+        triggerHaptic('error');
+        await rejectWithdrawal(id, reason || 'Verification failed');
+        const updated = await refreshWithdrawalsFromRemote();
+        setWithdrawals(updated);
+        showWithdrawalToast('❌ Withdrawal rejected and amount refunded to user balance.');
+        setConfirmDialog(null);
+      },
+    });
   };
 
-  const handleDeleteSingleWithdrawal = async (id: string) => {
-    const isConfirmed = window.confirm(
-      '⚠️ Kya aap is withdrawal request ko Firebase Database aur queue se PERMANENTLY DELETE karna chahte hain? Ye wapas nahi aayega.'
-    );
-    if (!isConfirmed) return;
-
-    triggerHaptic('error');
-    await deletePermanentWithdrawal(id);
-    const updated = await refreshWithdrawalsFromRemote();
-    setWithdrawals(updated);
-    showWithdrawalToast('🗑️ Withdrawal record permanently deleted from Firebase database.');
+  const handleDeleteSingleWithdrawal = (id: string) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Permanently Delete Record',
+      message: 'Kya aap is withdrawal request ko Firebase Database aur queue se PERMANENTLY DELETE karna chahte hain?\n\nYe record database se hamesha ke liye gayab ho jayega.',
+      confirmLabel: 'Delete Permanently 🗑️',
+      confirmColor: 'red',
+      onConfirm: async () => {
+        triggerHaptic('error');
+        await deletePermanentWithdrawal(id);
+        const updated = await refreshWithdrawalsFromRemote();
+        setWithdrawals(updated);
+        showWithdrawalToast('🗑️ Withdrawal record permanently deleted from Firebase database.');
+        setConfirmDialog(null);
+      },
+    });
   };
 
-  const handleCleanProcessedWithdrawals = async () => {
+  const handleCleanProcessedWithdrawals = () => {
     const processedCount = withdrawals.filter((w) => w.status === 'approved' || w.status === 'rejected').length;
     if (processedCount === 0) {
-      alert('ℹ️ Database mein koi bhi Approved ya Rejected records nahi hain. Sirf Pending requests bachi hain.');
+      showWithdrawalToast('ℹ️ Database mein koi bhi Approved ya Rejected records nahi hain.');
       return;
     }
-    const isConfirmed = window.confirm(
-      `🧹 Kya aap sabhi ${processedCount} Approved aur Rejected records ko Firebase Database se PERMANENTLY DELETE karna chahte hain?\n\n(Note: Pending requests delete nahi hongi aur safe rahengi).`
-    );
-    if (!isConfirmed) return;
 
-    triggerHaptic('medium');
-    const count = await deleteProcessedWithdrawals();
-    const updated = await refreshWithdrawalsFromRemote();
-    setWithdrawals(updated);
-    showWithdrawalToast(`🧹 ${count} processed records Firebase database se permanently clean kar diye gaye!`);
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Clean Processed History',
+      message: `Kya aap sabhi ${processedCount} Approved aur Rejected records ko Firebase Database se PERMANENTLY DELETE karna chahte hain?\n\n(Pending requests delete nahi hongi aur safe rahengi).`,
+      confirmLabel: `Clean ${processedCount} Records 🧹`,
+      confirmColor: 'amber',
+      onConfirm: async () => {
+        triggerHaptic('medium');
+        const count = await deleteProcessedWithdrawals();
+        const updated = await refreshWithdrawalsFromRemote();
+        setWithdrawals(updated);
+        showWithdrawalToast(`🧹 ${count} processed records permanently clean kar diye gaye!`);
+        setConfirmDialog(null);
+      },
+    });
   };
 
-  const handleClearAllWithdrawals = async () => {
-    const isConfirmed = window.confirm(
-      '🚨 KHATRA (WARNING): Kya aap Firebase Database se SAARI WITHDRAWALS (Approved, Rejected, aur Pending) PERMANENTLY DELETE karna chahte hain?\n\nDatabase 100% KHALI ho jayega aur count 0 ho jayega!'
-    );
-    if (!isConfirmed) return;
-
-    triggerHaptic('error');
-    await clearAllWithdrawalsPermanent();
-    const updated = await refreshWithdrawalsFromRemote();
-    setWithdrawals(updated);
-    showWithdrawalToast('💥 Sabhi withdrawals database se permanently delete ho gayi! Database khali hai.');
+  const handleClearAllWithdrawals = () => {
+    setConfirmDialog({
+      isOpen: true,
+      title: '🚨 KHATRA: Clear Entire Database',
+      message: 'Kya aap Firebase Database se SAARI WITHDRAWALS (Approved, Rejected, aur Pending) PERMANENTLY DELETE karna chahte hain?\n\nDatabase 100% KHALI ho jayega aur count 0 ho jayega!',
+      confirmLabel: 'Yes, Wipe All Database 💥',
+      confirmColor: 'red',
+      onConfirm: async () => {
+        triggerHaptic('error');
+        await clearAllWithdrawalsPermanent();
+        const updated = await refreshWithdrawalsFromRemote();
+        setWithdrawals(updated);
+        showWithdrawalToast('💥 Sabhi withdrawals database se permanently delete ho gayi! Database khali hai.');
+        setConfirmDialog(null);
+      },
+    });
   };
 
   const handleSaveSettings = (e: React.FormEvent) => {
@@ -1274,6 +1324,61 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
           </div>
         )}
       </div>
+
+      {/* Confirmation & Rejection Modal Dialog (Iframe & WebApp safe) */}
+      {confirmDialog && confirmDialog.isOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 w-full max-w-sm rounded-3xl p-6 shadow-2xl animate-scale-up">
+            <h3 className="font-['Outfit'] font-black text-lg text-white mb-2">
+              {confirmDialog.title}
+            </h3>
+            <p className="text-xs text-slate-300 leading-relaxed whitespace-pre-line mb-4">
+              {confirmDialog.message}
+            </p>
+
+            {confirmDialog.showInput && (
+              <div className="mb-4">
+                {confirmDialog.inputLabel && (
+                  <label className="text-[11px] font-bold text-slate-400 block mb-1">
+                    {confirmDialog.inputLabel}
+                  </label>
+                )}
+                <input
+                  type="text"
+                  value={dialogInputValue}
+                  onChange={(e) => setDialogInputValue(e.target.value)}
+                  placeholder={confirmDialog.inputPlaceholder}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-sky-500"
+                  autoFocus
+                />
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => setConfirmDialog(null)}
+                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs transition-all cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => confirmDialog.onConfirm(dialogInputValue)}
+                className={`w-full py-2.5 rounded-xl font-bold text-xs text-white transition-all cursor-pointer shadow-lg active:scale-95 ${
+                  confirmDialog.confirmColor === 'emerald'
+                    ? 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-700/30'
+                    : confirmDialog.confirmColor === 'amber'
+                    ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-700/30'
+                    : 'bg-rose-600 hover:bg-rose-500 shadow-rose-700/30'
+                }`}
+              >
+                {confirmDialog.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
